@@ -1242,6 +1242,7 @@ class GRPOTrainer(Trainer):
                             self.model, prompt_completion_ids, attention_mask, logits_to_keep
                         )["logps"]
             else:
+<<<<<<< Updated upstream
                 ref_per_token_logps = None
 
         # Decode the generated completions
@@ -1366,6 +1367,84 @@ class GRPOTrainer(Trainer):
 
     @profiling_decorator
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
+=======
+                completions = completions_text
+
+            rewards_tmp = prompt_completion_pairs[stage_id].get("rewards", None)
+            reward_functions_tmp = prompt_completion_pairs[stage_id].get("reward_functions", None)
+
+            rewards_per_func = rewards_tmp
+
+            # Gather the reward per function: this part is crucial, because the rewards are normalized per group and the
+            # completions may be distributed across processes
+            rewards_per_func = gather(rewards_per_func)
+
+            # Apply weights to each reward function's output and sum
+            rewards = (rewards_per_func * self.reward_weights.to(device).unsqueeze(0)).sum(dim=1)
+
+            # Compute grouped-wise rewards
+            mean_grouped_rewards = rewards.view(-1, self.num_generations).mean(dim=1)
+            std_grouped_rewards = rewards.view(-1, self.num_generations).std(dim=1)
+
+            # Normalize the rewards to compute the advantages
+            mean_grouped_rewards = mean_grouped_rewards.repeat_interleave(self.num_generations, dim=0)
+            std_grouped_rewards = std_grouped_rewards.repeat_interleave(self.num_generations, dim=0)
+            advantages = (rewards - mean_grouped_rewards) / (std_grouped_rewards + 1e-4)
+
+            # Slice to keep only the local part of the data
+            process_slice = slice(
+                self.accelerator.process_index * len(prompts),
+                (self.accelerator.process_index + 1) * len(prompts),
+            )
+            advantages = advantages[process_slice]
+
+            # Log the metrics
+            reward_per_func = rewards_per_func.mean(0)
+            for i, reward_func in enumerate(reward_functions_tmp):
+                if isinstance(reward_func, nn.Module):  # Module instead of PretrainedModel for compat with compiled models
+                    reward_func_name = reward_func.config._name_or_path.split("/")[-1]
+                else:
+                    reward_func_name = reward_func.__name__
+                self._metrics[f"rewards/stage-{stage_id}/{reward_func_name}"].append(reward_per_func[i].item())
+
+            self._metrics[f"reward/stage-{stage_id}"].append(rewards.mean().item())
+            self._metrics[f"reward_std/stage-{stage_id}"].append(std_grouped_rewards.mean().item())
+
+            if (
+                self.log_completions
+                and self.state.global_step % self.args.logging_steps == 0
+                and "wandb" in self.args.report_to
+            ):
+                import pandas as pd
+
+                # For logging
+                table = {
+                    "step": [str(self.state.global_step)] * len(rewards),
+                    "prompt": gather_object(prompts_text),
+                    "completion": gather_object(completions_text),
+                    "reward": rewards.tolist(),
+                }
+                df = pd.DataFrame(table)
+
+                if wandb.run is not None and self.accelerator.is_main_process:
+                    wandb.log({"completions": wandb.Table(dataframe=df)})
+
+            all_stages_inputs.append(
+                {
+                    "prompt_ids": prompt_ids,
+                    "prompt_mask": prompt_mask,
+                    "completion_ids": completion_ids,
+                    "completion_mask": completion_mask,
+                    "ref_per_token_logps": ref_per_token_logps,
+                    "advantages": advantages,
+                    "prompt_text": prompts_text,
+                    "completion": completions_text,
+                }
+            )
+        return all_stages_inputs
+
+    def compute_loss(self, model, inputs_list, return_outputs=False, num_items_in_batch=None):
+>>>>>>> Stashed changes
         if return_outputs:
             raise ValueError("The GRPOTrainer does not support returning outputs")
         if self.use_liger_loss:
